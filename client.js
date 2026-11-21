@@ -5,7 +5,7 @@
  * and each operation calls the Host's /api/dsh-redis-client routes.
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-redis-client',
+  id: '@oakzhong/dsh-redis-client',
   factory(require) {
     const React = require('react')
     const h = React.createElement

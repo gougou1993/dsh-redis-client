@@ -4,7 +4,7 @@
 
 ## 插件信息
 
-- **包名**：`@oakzhong/dsh-redis-client`
+- **包名**：`dsh-redis-client`
 - **版本**：1.0.0
 - **入口**：左侧栏「Redis 客户端」
 - **类型**：Host + Client 双半部插件（bundle）

@@ -1,4 +1,4 @@
 # Redis client bundle: the Host half runs redis-cli; `dsh.client` renders the UI.
 - insert:
     - id: dsh-redis-client
-      name: dsh-redis-client
+      name: '@oakzhong/dsh-redis-client'
