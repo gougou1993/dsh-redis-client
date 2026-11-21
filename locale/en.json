@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Redis client",
+    "description": "Manage Redis connections and browse keys, values and TTLs from the left sidebar."
+  }
+}

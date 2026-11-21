@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Redis 客户端",
+    "description": "在左侧栏管理 Redis 连接，浏览键值、类型与过期时间。"
+  }
+}
