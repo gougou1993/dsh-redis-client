@@ -1,94 +1,94 @@
-# Redis 客户端（dsh-redis-client）
+# Redis Client (dsh-redis-client)
 
-一款运行在 DSH（DeepSeek Harness）中的 Redis 管理插件。左侧栏提供入口，可管理多个 Redis 连接、浏览键值、执行命令。基于系统 `redis-cli`，无需额外 npm 依赖。
+A Redis management plugin for DSH (DeepSeek Harness). It provides a left-sidebar entry for managing multiple Redis connections, browsing keys and values, and running commands. Redis interaction uses the pure-JavaScript `ioredis` client over the wire — **no `redis-cli` install required**, and it works the same on Windows, macOS and Linux.
 
-## 插件信息
+## Plugin Info
 
-- **包名**：`dsh-redis-client`
-- **版本**：1.0.0
-- **入口**：左侧栏「Redis 客户端」
-- **类型**：Host + Client 双半部插件（bundle）
+- **Package**: `@oakzhong/dsh-redis-client`
+- **Version**: 1.1.0
+- **Entry**: left sidebar panel "Redis client" (slot id `redis-client`)
+- **Type**: Host + Client two-half Cordis bundle
 
-## 使用技术
+## Tech Stack
 
-| 层面 | 技术 |
+| Layer | Technology |
 |---|---|
-| 插件框架 | DSH Cordis bundle（`cordis.patch.yml` 插入 Loader 行） |
-| Host 半部 | ESM `apply(ctx)`，通过 `ctx.connection.fetch.register` 注册 7 条 API 路由 |
-| Redis 交互 | 调用系统 `redis-cli`（本机 `/usr/local/bin/redis-cli`，v6.0.8），零 npm 依赖 |
-| 命令执行 | Node `child_process.execFile`，参数数组传递避免注入 |
-| 连接配置 | Client 保存在 `localStorage`（`dsh-redis-client.connections.v1` / `.active.v1`） |
-| Client 半部 | `window.__ModuleLoader__` 注册，React 无 JSX（`React.createElement`） |
-| UI 样式 | 组件内注入 `<style>`，使用 DSH 主题 token |
-| 国际化 | `ctx.locale.register / bind`，中英双语（zh / en） |
+| Plugin framework | DSH Cordis bundle (`cordis.patch.yml` inserts the Loader line) |
+| Module format | ESM (`"type": "module"`) |
+| Host half | ESM `apply(ctx)`, registers 7 API routes via `ctx.connection.fetch.register` |
+| Client half | `window.__ModuleLoader__` registration, React without JSX (`React.createElement`) |
+| Redis interaction | `ioredis` (pure JavaScript RESP client); one pooled connection per `host:port:db:user`, commands sent over the wire without spawning any external process |
+| Connection config | Stored in browser `localStorage` (`dsh-redis-client.connections.v1`, `dsh-redis-client.active.v1`); nothing persisted on the Host |
+| UI styling | Injected `<style>` using DSH theme tokens |
+| Internationalization | `ctx.locale.register` / `bind`, zh / en dictionaries |
 
-## 功能
+## Features
 
-### 1. 连接管理
-- 新建 / 编辑 / 删除多个 Redis 连接
-- 配置项：名称、主机、端口、密码、数据库索引
-- 测试连接（PING），显示已连接/断开状态
-- 连接配置保存在本机 localStorage，刷新不丢失
+### 1. Connection management
+- Create, edit, and delete multiple Redis connections
+- Fields: name, host, port, password, username (optional), database index, **group**
+- **Grouping**: connections are listed under collapsible group headers (count shown per group); a blank group renders as "Ungrouped"; the form offers existing group names for reuse, and a control collapses/expands all groups at once
+- Test connection via PING; the result is shown inline — **green for success, red for failure** — for quick scanning
+- Connection actions are laid out two per row: New/Test on the first row, Export/Import on the second
+- Connections persist in localStorage across refreshes
+- **Password storage**: passwords are stored in the DSH credential store (`$DSH_HOME/.credentials.yaml`), never in browser `localStorage` and never returned to the UI; connections only carry a `hasPassword` flag
+- **Export**: download all connections as a JSON file (`redis-connections.json`); **passwords are excluded by default**, so shared files are safe to hand to others who will supply their own password
+- **Deleting a connection also deletes its stored password**; if the credential store cannot be cleared the delete is aborted with an error, so no orphaned secret is left behind
+- **Prune orphaned passwords**: removes any `REDIS_CONN_*` entry whose connection no longer exists
+- **Import**: load connections from a JSON file; entries are appended with regenerated ids after confirmation, and any password present in the file is moved into the credential store instead of being kept in the browser
 
-### 2. 数据库与键浏览
-- 查看数据库列表（DBSIZE / 库切换）
-- 按模式扫描键（`--scan --pattern`，兼容 redis-cli 6.x，不用 `--count`）
-- 显示每个键的类型、TTL、值
-- 支持不同数据类型读取（string / hash / list / set / zset）
+### 2. Databases & key browsing
+- Read keyspace info for all 16 databases via `INFO keyspace`
+- Scan keys by pattern using cursor-based `SCAN ... MATCH ... COUNT 500` (capped at 10000 keys per query)
+- Display key type, TTL, and value for each key
 
-### 3. 键值操作
-- 读取键值（GET / HGETALL / LRANGE 等按类型）
-- 删除键
-- 设置过期时间（TTL 秒数，-1 表示永久）
+### 3. Key value reading
+- Read values by type: string (`GET`), hash (`HGETALL`), list (`LRANGE 0 199`), set (`SMEMBERS`), zset (`ZRANGE 0 199 WITHSCORES`)
+- TTL in seconds, or "permanent" when no expiry is set
 
-### 4. 命令行
-- 直接输入 Redis 命令执行，显示原始输出
-- 常用命令提示：GET / SET / DBSIZE / INFO 等
+### 4. Key operations
+- Delete keys via `DEL` (with confirmation)
+- Set expiry via `EXPIRE` (seconds); `-1` uses `PERSIST` to make a key permanent
 
-## Host API 路由
+### 5. Command line
+- Run arbitrary Redis commands and show raw stdout output (plus stderr warnings)
+- Quote-aware command tokenization
+- Quick-command hints: `GET key`, `SET key val`, `DBSIZE`, `INFO`
 
-所有路由前缀 `/api/dsh-redis-client/`：
+### Host API routes
 
-| 路由 | 方法 | 说明 |
+All routes are prefixed with `/api/dsh-redis-client/`:
+
+| Route | Method | Description |
 |---|---|---|
-| `ping` | POST | 测试连接（PING） |
-| `dbs` | POST | 查询数据库信息 |
-| `keys` | POST | 扫描键（支持 pattern） |
-| `get` | POST | 读取键值（按类型） |
-| `delete` | POST | 删除键 |
-| `expire` | POST | 设置过期时间 |
-| `command` | POST | 执行任意 Redis 命令 |
+| `ping` | POST | Test connection (PING) |
+| `dbs` | POST | Read keyspace info for the 16 databases |
+| `keys` | POST | Scan keys (supports pattern) |
+| `get` | POST | Read a key's value (by type) |
+| `delete` | POST | Delete keys |
+| `expire` | POST | Set a key's TTL |
+| `command` | POST | Run an arbitrary Redis command |
 
-## 依赖与环境
-
-- 需要本机安装 `redis-cli`（默认路径 `/usr/local/bin/redis-cli`）
-- 目标 Redis 服务网络可达
-- 连接密码等敏感信息仅保存在本机 localStorage，不上传
-
-## 注意事项
-
-- redis-cli 6.0.8 的 `--scan` 支持 `--pattern`，**不支持 `--count`**（旧版写法会报 "Unrecognized option"）
-- 命令通过参数数组传递，避免 shell 注入
-- Host 侧修改后需通过插件管理器 disable→enable 重新加载路由，`unlag_refresh` 只刷新前端
-
-## 目录结构
+## Directory Structure
 
 ```
 dsh-redis-client/
-├── package.json          # 清单（命名空间包）、bundle 配置、client 注入声明
-├── cordis.patch.yml      # Loader 插入行
-├── index.js              # Host 半部：7 条 Redis 路由（redis-cli 封装）
-├── client.js             # Client 半部：连接管理、键浏览、命令行、样式
+├── package.json          # Manifest (scoped package), bundle config, client inject declaration
+├── cordis.patch.yml      # Loader insertion line
+├── index.js              # Host half: routes over ioredis (no redis-cli needed)
+├── client.js             # Client half: connection management, key browsing, command line, styles
 ├── locale/
-│   ├── zh.json           # 中文显示元信息
-│   └── en.json           # 英文显示元信息
-├── icon.svg              # 插件图标
-└── README.md             # 本文档
+│   ├── zh.json           # Chinese display metadata
+│   └── en.json           # English display metadata
+├── icon.svg              # Plugin icon
+├── README.md             # English documentation
+└── README.zh.md          # Chinese documentation
 ```
 
-## 安装与使用
+## Installation & Usage
 
-1. 确认本机有 `redis-cli`
-2. 通过插件管理器安装该 bundle（`install_bundle` 指向本目录）
-3. 左侧栏点击「Redis 客户端」
-4. 新建连接并测试，成功后即可浏览键、执行命令
+1. Make sure `redis-cli` is available on the Host (set `REDIS_CLI_PATH` or have `redis-cli` on PATH) and the target Redis server is reachable.
+2. Install the bundle through the plugin manager (`install_bundle` pointing at this directory).
+3. Click "Redis client" in the left sidebar.
+4. Create a connection and test it; once connected, scan keys, inspect values, and run commands.
+5. After changing Host-side code, disable → enable the plugin to reload routes (`unlag_refresh` only refreshes the front end).

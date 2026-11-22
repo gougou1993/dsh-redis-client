@@ -29,6 +29,11 @@ window.__ModuleLoader__.load({
       command: '命令行', run: '执行', output: '输出', noConn: '请先新建并选择一个连接。',
       noWorkspace: '', listFailed: '操作失败', confirmDelete: '确定删除该连接？', confirmDelKey: '确定删除这个键？',
       expireHint: '秒数，-1 表示永久', quickCmd: '常用：GET key / SET key val / DBSIZE / INFO',
+      import: '导入连接', export: '导出连接', confirmImport: '导入将追加到现有连接列表，继续？',
+      importOk: '成功导入 {n} 个连接', importFail: '导入失败：文件格式不正确', exported: '已导出 {n} 个连接（不含密码）', back: '返回',
+      pwdSaved: '密码已保存到本机凭证库', pwdHint: '密码保存在本机凭证库，不写入浏览器存储', pwdEmpty: '留空则不修改已存密码',
+      secretClearFail: '删除连接失败：密码未能从凭证库清除', pruneSecret: '清理孤立密码', prunedN: '已清理 {n} 条孤立密码', pruneNone: '没有孤立密码',
+      group: '分组', groupPlaceholder: '分组名称（留空=未分组）', ungrouped: '未分组', collapseAll: '全部折叠', expandAll: '全部展开',
     }
     const en = {
       title: 'Redis client', subtitle: 'Manage Redis connections and browse keys and values.',
@@ -41,6 +46,11 @@ window.__ModuleLoader__.load({
       command: 'Command', run: 'Run', output: 'Output', noConn: 'Create and select a connection first.',
       noWorkspace: '', listFailed: 'Operation failed', confirmDelete: 'Delete this connection?', confirmDelKey: 'Delete this key?',
       expireHint: 'Seconds, -1 for permanent', quickCmd: 'Try: GET key / SET key val / DBSIZE / INFO',
+      import: 'Import', export: 'Export', confirmImport: 'Import will append to existing connections. Continue?',
+      importOk: 'Imported {n} connections', importFail: 'Import failed: invalid file format', exported: 'Exported {n} connections (no passwords)', back: 'Back',
+      pwdSaved: 'Password saved to the local credential store', pwdHint: 'Passwords live in the local credential store, not browser storage', pwdEmpty: 'Leave blank to keep the stored password',
+      secretClearFail: 'Delete aborted: the stored password could not be cleared', pruneSecret: 'Prune orphaned passwords', prunedN: 'Pruned {n} orphaned passwords', pruneNone: 'No orphaned passwords',
+      group: 'Group', groupPlaceholder: 'Group name (blank = ungrouped)', ungrouped: 'Ungrouped', collapseAll: 'Collapse all', expandAll: 'Expand all',
     }
     let t = (key) => (zh[key] || key)
     const fmt = (s, v) => String(s || '').replace(/\{(\w+)\}/g, (_, k) => (v && v[k] != null ? v[k] : ''))
@@ -84,11 +94,14 @@ window.__ModuleLoader__.load({
     }
 
     function RedisPanel({ ctx }) {
+      const fileRef = useRef(null)
       const [conns, setConns] = useState(readConns)
       const [activeId, setActiveId] = useState(readActive)
       const [editing, setEditing] = useState(null)
-      const [form, setForm] = useState({ name: '', host: '127.0.0.1', port: 6379, password: '', username: '', db: 0 })
+      const [form, setForm] = useState({ name: '', host: '127.0.0.1', port: 6379, password: '', username: '', db: 0, group: '' })
       const [ping, setPing] = useState('')
+      const [pingOk, setPingOk] = useState(false)
+      const [collapsed, setCollapsed] = useState({})
       const [keys, setKeys] = useState([])
       const [pattern, setPattern] = useState('*')
       const [selected, setSelected] = useState('')
@@ -100,45 +113,161 @@ window.__ModuleLoader__.load({
       const [expireVal, setExpireVal] = useState('-1')
 
       const active = useMemo(() => conns.find((c) => c.id === activeId) || null, [conns, activeId])
-      const connCfg = active ? { host: active.host, port: active.port, password: active.password, username: active.username, db: active.db } : null
+      // Group connections by their `group` field; empty group renders as "Ungrouped".
+      const grouped = useMemo(() => {
+        const map = new Map()
+        for (const c of conns) {
+          const g = (c.group || '').trim()
+          if (!map.has(g)) map.set(g, [])
+          map.get(g).push(c)
+        }
+        return Array.from(map.entries()).sort((a, b) => {
+          if (a[0] === '') return 1
+          if (b[0] === '') return -1
+          return a[0].localeCompare(b[0])
+        })
+      }, [conns])
+
+      const connCfg = active ? { id: active.id, host: active.host, port: active.port, username: active.username, db: active.db, hasPassword: Boolean(active.hasPassword) } : null
 
       useEffect(() => { writeConns(conns) }, [conns])
       useEffect(() => { writeActive(activeId) }, [activeId])
 
-      const saveConn = useCallback(() => {
+      // One-time migration: older versions kept the plaintext password in localStorage.
+      // Move any such value into the Host credential store, then drop it locally.
+      useEffect(() => {
+        let cancelled = false
+        ;(async () => {
+          const legacy = conns.filter((c) => typeof c.password === 'string' && c.password)
+          if (!legacy.length) return
+          for (const c of legacy) {
+            try { await api('/secret_set', { id: c.id, password: c.password }) } catch (_) { return }
+          }
+          if (cancelled) return
+          setConns((prev) => prev.map((c) => {
+            if (typeof c.password !== 'string' || !c.password) return c
+            const { password, ...rest } = c
+            return { ...rest, hasPassword: true }
+          }))
+        })()
+        return () => { cancelled = true }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [])
+
+      const saveConn = useCallback(async () => {
+        const id = editing || makeId()
+        const password = form.password || ''
+        // Passwords never enter localStorage: they go to the Host credential store.
         const c = {
-          id: editing || makeId(),
+          id,
           name: form.name.trim() || (form.host + ':' + form.port),
           host: form.host.trim() || '127.0.0.1',
           port: Number(form.port) || 6379,
-          password: form.password || '', username: form.username || '',
+          hasPassword: Boolean(password) || Boolean(editing && conns.find((x) => x.id === editing)?.hasPassword),
+          username: form.username || '',
           db: Number(form.db) || 0,
+          group: (form.group || '').trim(),
         }
         setConns((prev) => editing ? prev.map((x) => x.id === editing ? c : x) : [...prev, c])
-        setActiveId(c.id)
+        setActiveId(id)
         setEditing(null)
         setPing('')
         setErr('')
-      }, [form, editing])
+        try {
+          if (password) await api('/secret_set', { id, password })
+          else if (editing) await api('/secret_set', { id, password: '' })
+        } catch (e) { setErr(e.message) }
+      }, [form, editing, conns])
+
+      const exportConns = useCallback(() => {
+        const payload = {
+          app: 'dsh-redis-client', version: 1,
+          exportedAt: new Date().toISOString(),
+          // Passwords are never exported by default: they live only in the Host credential store.
+          connections: conns.map(({ id, ...rest }) => ({ ...rest, password: '', hasPassword: Boolean(rest.hasPassword) })),
+        }
+        try {
+          const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
+          const url = URL.createObjectURL(blob)
+          const a = document.createElement('a')
+          a.href = url; a.download = 'redis-connections.json'
+          document.body.appendChild(a); a.click(); a.remove()
+          setTimeout(() => URL.revokeObjectURL(url), 1000)
+          setErr(fmt(t('exported'), { n: conns.length }))
+        } catch (e) { setErr(e.message) }
+      }, [conns])
+
+      const importConns = useCallback(async (e) => {
+        const file = e.target.files && e.target.files[0]
+        if (!file) return
+        try {
+          const text = await file.text()
+          const data = JSON.parse(text)
+          const list = Array.isArray(data) ? data : (data && Array.isArray(data.connections) ? data.connections : null)
+          if (!list) { setErr(t('importFail')); return }
+          const pending = []
+          const clean = list.filter((x) => x && x.host)
+            .map((x) => {
+              const id = makeId()
+              const pwd = typeof x.password === 'string' ? x.password : ''
+              if (pwd) pending.push({ id, password: pwd })
+              return {
+                id,
+                name: x.name || (x.host + ':' + (x.port || 6379)),
+                host: String(x.host), port: Number(x.port) || 6379,
+                hasPassword: Boolean(pwd) || Boolean(x.hasPassword),
+                username: x.username || '', db: Number(x.db) || 0,
+              }
+            })
+          if (!clean.length) { setErr(t('importFail')); return }
+          if (!window.confirm(t('confirmImport'))) return
+          // Move any passwords carried by the file into the Host credential store.
+          for (const item of pending) {
+            try { await api('/secret_set', item) } catch (_) {}
+          }
+          setConns((prev) => [...prev, ...clean])
+          setActiveId(clean[0].id)
+          setErr(fmt(t('importOk'), { n: clean.length }))
+        } catch (_) { setErr(t('importFail')) }
+        e.target.value = ''
+      }, [])
+
+      const pruneSecrets = useCallback(async () => {
+        setBusy(true); setErr('')
+        try {
+          const d = await api('/secret_prune', { ids: conns.map((c) => c.id) })
+          const n = Number(d && d.removed) || 0
+          setErr(n > 0 ? fmt(t('prunedN'), { n }) : t('pruneNone'))
+        } catch (e) { setErr(e.message) }
+        finally { setBusy(false) }
+      }, [conns])
 
       const editConn = useCallback((c) => {
         setEditing(c.id)
-        setForm({ name: c.name, host: c.host, port: c.port, password: c.password || '', username: c.username || '', db: c.db || 0 })
+        setForm({ name: c.name, host: c.host, port: c.port, password: '', username: c.username || '', db: c.db || 0, group: c.group || '' })
       }, [])
 
-      const removeConn = useCallback((id) => {
+      const removeConn = useCallback(async (id) => {
         if (!window.confirm(t('confirmDelete'))) return
+        // Clear the stored password first; if that fails the user must know, otherwise a secret is orphaned.
+        try {
+          await api('/secret_clear', { id })
+        } catch (e) {
+          setErr(t('secretClearFail') + (e.message ? ': ' + e.message : ''))
+          return
+        }
         setConns((prev) => prev.filter((c) => c.id !== id))
-        if (activeId === id) { setActiveId(''); setKeys([]); setSelected(''); setDetail(null) }
+        if (activeId === id) { setActiveId(''); setKeys([]); setSelected(''); setDetail(null); setPing(''); setPingOk(false) }
       }, [activeId])
 
       const testConn = useCallback(async () => {
         if (!connCfg) return
-        setBusy(true); setErr(''); setPing('')
+        setBusy(true); setErr(''); setPing(''); setPingOk(false)
         try {
           const d = await api('/ping', { connection: connCfg })
-          setPing(d.ok ? t('pingOk') : (t('pingFail') + ': ' + d.raw))
-        } catch (e) { setPing(t('pingFail')); setErr(e.message) }
+          setPingOk(Boolean(d.ok))
+          setPing(d.ok ? t('pingOk') : (t('pingFail') + (d.raw ? ': ' + d.raw : '')))
+        } catch (e) { setPingOk(false); setPing(t('pingFail') + (e.message ? ': ' + e.message : '')) }
         finally { setBusy(false) }
       }, [connCfg])
 
@@ -233,28 +362,68 @@ window.__ModuleLoader__.load({
           // left: connections
           h('div', { className: 'dshRds-col' },
             h('div', { className: 'dshRds-card' },
-              h('div', { className: 'dshRds-cardTitle' }, t('connections')),
+              h('div', { className: 'dshRds-cardTitleRow' },
+                h('span', { className: 'dshRds-cardTitle' }, t('connections')),
+                grouped.length > 1
+                  ? h('button', {
+                      type: 'button', className: 'dshRds-mini',
+                      onClick: () => setCollapsed((prev) => {
+                        const allCollapsed = grouped.every(([g]) => prev[g || '__ungrouped__'])
+                        const next = {}
+                        for (const [g] of grouped) next[g || '__ungrouped__'] = !allCollapsed
+                        return next
+                      }),
+                    }, grouped.every(([g]) => collapsed[g || '__ungrouped__']) ? t('expandAll') : t('collapseAll'))
+                  : null
+              ),
               h('div', { className: 'dshRds-connList' },
                 conns.length === 0
                   ? h('div', { className: 'dshRds-note' }, t('noConn'))
-                  : conns.map((c) =>
-                      h('div', {
-                        key: c.id,
-                        className: 'dshRds-conn' + (activeId === c.id ? ' dshRds-connOn' : ''),
-                        onClick: () => { setActiveId(c.id); setKeys([]); setSelected(''); setDetail(null); setPing('') },
-                      },
-                        h('span', { className: 'dshRds-name' }, c.name),
-                        h('span', { className: 'dshRds-addr' }, `${c.host}:${c.port}`),
-                        h('button', { type: 'button', className: 'dshRds-mini', onClick: (e) => { e.stopPropagation(); editConn(c) } }, t('edit')),
-                        h('button', { type: 'button', className: 'dshRds-mini dshRds-del', onClick: (e) => { e.stopPropagation(); removeConn(c.id) } }, '×')
+                  : grouped.map(([groupName, list]) => {
+                      const key = groupName || '__ungrouped__'
+                      const isCollapsed = Boolean(collapsed[key])
+                      return h('div', { key, className: 'dshRds-group' },
+                        h('div', {
+                          className: 'dshRds-groupHead',
+                          onClick: () => setCollapsed((prev) => ({ ...prev, [key]: !prev[key] })),
+                        },
+                          h('span', { className: 'dshRds-groupArrow' }, isCollapsed ? '▸' : '▾'),
+                          h('span', { className: 'dshRds-groupName' },
+                            (groupName || t('ungrouped')),
+                            h('span', { className: 'dshRds-groupCount' }, ' (' + list.length + ')')
+                          )
+                        ),
+                        isCollapsed
+                          ? null
+                          : list.map((c) =>
+                              h('div', {
+                                key: c.id,
+                                className: 'dshRds-conn' + (activeId === c.id ? ' dshRds-connOn' : ''),
+                                onClick: () => { setActiveId(c.id); setKeys([]); setSelected(''); setDetail(null); setPing(''); setPingOk(false) },
+                              },
+                                h('span', { className: 'dshRds-name' }, c.name),
+                                h('span', { className: 'dshRds-addr' }, `${c.host}:${c.port}`),
+                                c.hasPassword ? h('span', { className: 'dshRds-lock', title: t('pwdSaved') }, '🔒') : null,
+                                h('button', { type: 'button', className: 'dshRds-mini', onClick: (e) => { e.stopPropagation(); editConn(c) } }, t('edit')),
+                                h('button', { type: 'button', className: 'dshRds-mini dshRds-del', onClick: (e) => { e.stopPropagation(); removeConn(c.id) } }, '×')
+                              )
+                            )
                       )
-                    )
+                    })
               ),
-              h('button', { type: 'button', className: 'dshRds-btn dshRds-btnPrimary', onClick: () => { setEditing(null); setForm({ name: '', host: '127.0.0.1', port: 6379, password: '', username: '', db: 0 }) } }, '+ ' + t('newConn')),
-              active
-                ? h('button', { type: 'button', className: 'dshRds-btn', disabled: busy, onClick: testConn }, t('test'))
-                : null,
-              ping ? h('div', { className: 'dshRds-note' }, ping) : null
+              h('div', { className: 'dshRds-btnRow' },
+                h('button', { type: 'button', className: 'dshRds-btn dshRds-btnPrimary', onClick: () => { setEditing(null); setForm({ name: '', host: '127.0.0.1', port: 6379, password: '', username: '', db: 0, group: '' }) } }, '+ ' + t('newConn')),
+                h('button', { type: 'button', className: 'dshRds-btn', disabled: !active || busy, onClick: testConn }, t('test'))
+              ),
+              h('div', { className: 'dshRds-btnRow' },
+                h('button', { type: 'button', className: 'dshRds-btn', title: t('export'), onClick: exportConns }, t('export')),
+                h('button', { type: 'button', className: 'dshRds-btn', title: t('import'), onClick: () => fileRef.current && fileRef.current.click() }, t('import'))
+              ),
+              h('button', { type: 'button', className: 'dshRds-btn dshRds-btnWide', disabled: busy, title: t('pruneSecret'), onClick: pruneSecrets }, t('pruneSecret')),
+              h('input', { ref: fileRef, type: 'file', accept: '.json,application/json', style: { display: 'none' }, onChange: importConns }),
+              ping
+                ? h('div', { className: 'dshRds-ping ' + (pingOk ? 'dshRds-pingOk' : 'dshRds-pingFail') }, ping)
+                : null
             ),
             // connection form
             h('div', { className: 'dshRds-card' },
@@ -263,6 +432,19 @@ window.__ModuleLoader__.load({
                 formRow('name', 'name'), formRow('host', 'host'),
                 formRow('port', 'port', 'number'), formRow('password', 'password', 'password'),
                 formRow('username', 'username'), formRow('db', 'db', 'number'),
+                h('label', { className: 'dshRds-field' },
+                  h('span', { className: 'dshRds-label' }, t('group')),
+                  h('input', {
+                    className: 'dshRds-input', list: 'dshRds-groupOptions', value: form.group || '',
+                    placeholder: t('groupPlaceholder'),
+                    onChange: (e) => setForm((f) => ({ ...f, group: e.target.value })),
+                  }),
+                  h('datalist', { id: 'dshRds-groupOptions' },
+                    Array.from(new Set(conns.map((c) => (c.group || '').trim()).filter(Boolean)))
+                      .map((g) => h('option', { key: g, value: g }))
+                  )
+                ),
+                h('div', { className: 'dshRds-note' }, editing ? t('pwdEmpty') : t('pwdHint')),
                 h('button', { type: 'button', className: 'dshRds-btn dshRds-btnPrimary', onClick: saveConn }, t('save'))
               )
             )
@@ -365,16 +547,30 @@ window.__ModuleLoader__.load({
 .dshRds-fill{flex:1 1 auto;min-height:0}
 .dshRds-cardTitle{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary)}
 .dshRds-note{font-size:11px;color:var(--dsw-alias-label-secondary);line-height:1.5}
+.dshRds-btnRow{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.dshRds-btnRow .dshRds-btn{width:100%}
+.dshRds-btnWide{width:100%}
+.dshRds-ping{font-size:11px;line-height:1.5;font-weight:600;padding:4px 0}
+.dshRds-pingOk{color:#2e7d32}
+.dshRds-pingFail{color:var(--dsw-alias-state-error-primary)}
 .dshRds-btn{padding:7px 11px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-size:12px;cursor:pointer;font-family:inherit;white-space:nowrap}
 .dshRds-btn:hover{border-color:var(--dsw-alias-brand-primary)}
 .dshRds-btn:disabled{opacity:.45;cursor:not-allowed}
 .dshRds-btnPrimary{background:#d82c20;color:#fff;border-color:transparent;font-weight:600}
 .dshRds-del{color:var(--dsw-alias-state-error-primary)}
-.dshRds-connList{display:flex;flex-direction:column;gap:4px}
+.dshRds-connList{display:flex;flex-direction:column;gap:6px}
+.dshRds-group{display:flex;flex-direction:column;gap:4px}
+.dshRds-cardTitleRow{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.dshRds-groupHead{display:flex;align-items:center;gap:6px;padding:4px 6px;border-radius:6px;background:var(--dsw-alias-bg-layer-2);cursor:pointer;font-size:11px;font-weight:600;color:var(--dsw-alias-label-secondary)}
+.dshRds-groupHead:hover{color:var(--dsw-alias-label-primary)}
+.dshRds-groupArrow{width:10px;flex:0 0 auto}
+.dshRds-groupName{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dshRds-groupCount{font-weight:500;font-size:10px;opacity:.65;margin-left:1px}
 .dshRds-conn{display:flex;align-items:center;gap:6px;padding:7px 8px;border-radius:7px;border:1px solid var(--dsw-alias-border-l1);cursor:pointer;font-size:12px;flex-wrap:wrap}
 .dshRds-connOn{border-color:#d82c20;background:var(--dsw-alias-bg-layer-2)}
 .dshRds-name{font-weight:600;flex:1 1 auto}
 .dshRds-addr{font-size:10px;color:var(--dsw-alias-label-secondary)}
+.dshRds-lock{font-size:10px;margin-left:2px}
 .dshRds-mini{border:0;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer;padding:0 3px;font-family:inherit}
 .dshRds-form{display:flex;flex-direction:column;gap:7px}
 .dshRds-field{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--dsw-alias-label-secondary)}

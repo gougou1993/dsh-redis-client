@@ -1,21 +1,19 @@
 /**
  * Host half of the Redis client bundle.
  *
- * Runs redis-cli via a child process for each operation. Connection details
- * are supplied per request by the Client (stored locally there); nothing is
- * persisted on the Host. Args are passed as an argv array so values are never
- * interpreted by a shell.
+ * Talks to Redis over the wire with ioredis (pure JavaScript), so no local
+ * `redis-cli` install is required. Connection details come per request from the
+ * Client; passwords never leave the Host (they live in the DSH credential store).
  */
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
+import Redis from 'ioredis'
 
 export const name = 'dsh-redis-client'
-export const inject = ['connection']
+export const inject = ['connection', 'credentials']
 
-const execFileAsync = promisify(execFile)
 const API = '/api/dsh-redis-client'
-const CLI = process.env.REDIS_CLI_PATH || 'redis-cli'
-const TIMEOUT = 8000
+const CONNECT_TIMEOUT = 8000
+const COMMAND_TIMEOUT = 8000
+const MAX_LIVE_CLIENTS = 8
 
 class RedisError extends Error {
   constructor(message, status = 400) { super(message); this.status = status }
@@ -24,24 +22,12 @@ function json(value, status = 200) {
   return Response.json(value, { status, headers: { 'cache-control': 'no-store' } })
 }
 function failure(error, fallback) {
-  const message = error instanceof RedisError ? error.message : fallback
+  const message = error instanceof RedisError ? error.message : (error && error.message) || fallback
   const status = error instanceof RedisError ? error.status : 500
   return json({ error: message }, status)
 }
 function route(path, methods, fetch) {
   return { path: `${API}/${path}`, methods, requestBody: 'buffered', fetch }
-}
-
-// Build the argv prefix for a connection.
-function connArgs(cfg) {
-  const args = []
-  if (cfg.host) args.push('-h', String(cfg.host))
-  if (cfg.port) args.push('-p', String(cfg.port))
-  if (cfg.password) args.push('-a', String(cfg.password))
-  if (cfg.username) args.push('--user', String(cfg.username))
-  if (cfg.db !== undefined && cfg.db !== null && cfg.db !== '') args.push('-n', String(cfg.db))
-  if (cfg.timeout) args.push('-t', String(cfg.timeout))
-  return args
 }
 async function readBody(request) {
   try {
@@ -49,23 +35,170 @@ async function readBody(request) {
     return JSON.parse(text || '{}')
   } catch (_) { throw new RedisError('请求内容不是合法的 JSON。') }
 }
-// Run redis-cli with command args and return raw stdout.
-async function run(cfg, commandArgs) {
-  const argv = [...connArgs(cfg), ...commandArgs]
+
+// Credential reference for one connection. DSH refs must match /^[A-Za-z_][A-Za-z0-9_]*$/,
+// so a connection id like "c-abc-123" becomes REDIS_CONN_C_ABC_123.
+function refOf(connId) {
+  const safe = String(connId || '').replace(/[^A-Za-z0-9]/g, '_')
+  return 'REDIS_CONN_' + (safe || 'DEFAULT').toUpperCase()
+}
+async function getStoredPassword(ctx, connId) {
+  if (!connId) return ''
   try {
-    const { stdout, stderr } = await execFileAsync(CLI, argv, { timeout: TIMEOUT, maxBuffer: 8 * 1024 * 1024 })
-    // redis-cli may print warnings to stderr (e.g. AUTH warning) alongside valid stdout.
-    return { out: stdout, err: stderr }
+    const resolved = await ctx.credentials.resolve(refOf(connId))
+    // resolve() returns { value, source }, not a bare string.
+    if (resolved && typeof resolved === 'object' && typeof resolved.value === 'string') return resolved.value
+    if (typeof resolved === 'string') return resolved
+    return ''
+  } catch (_) { return '' }
+}
+async function withStoredPassword(ctx, cfg) {
+  const merged = { ...cfg }
+  if (!merged.password && merged.id) {
+    const stored = await getStoredPassword(ctx, merged.id)
+    if (stored) merged.password = stored
+    else if (merged.hasPassword) throw new RedisError('该连接的密码未保存，请重新编辑连接并填写密码。', 401)
+  }
+  return merged
+}
+
+// --- client pool -------------------------------------------------------------
+// One ioredis instance per host:port:db:user, reused across requests.
+const pool = new Map()
+function poolKey(cfg) {
+  return [cfg.host || '127.0.0.1', cfg.port || 6379, cfg.db || 0, cfg.username || '', cfg.password ? 'auth' : 'noauth'].join('|')
+}
+function createClient(cfg) {
+  const options = {
+    host: cfg.host || '127.0.0.1',
+    port: Number(cfg.port) || 6379,
+    db: Number(cfg.db) || 0,
+    connectTimeout: CONNECT_TIMEOUT,
+    commandTimeout: COMMAND_TIMEOUT,
+    maxRetriesPerRequest: 1,
+    enableReadyCheck: true,
+    lazyConnect: true,
+  }
+  if (cfg.password) options.password = String(cfg.password)
+  if (cfg.username) options.username = String(cfg.username)
+  const client = new Redis(options)
+  // Errors are surfaced per command; keep the emitter quiet to avoid unhandled noise.
+  client.on('error', () => {})
+  return client
+}
+async function getClient(cfg) {
+  const key = poolKey(cfg)
+  const existing = pool.get(key)
+  if (existing && existing.status === 'ready') return existing
+  if (existing) { try { existing.disconnect() } catch (_) {}; pool.delete(key) }
+  const client = createClient(cfg)
+  pool.set(key, client)
+  // Evict the oldest entries when the pool grows too large.
+  if (pool.size > MAX_LIVE_CLIENTS) {
+    for (const [k, c] of pool) {
+      if (pool.size <= MAX_LIVE_CLIENTS) break
+      if (k === key) continue
+      try { c.disconnect() } catch (_) {}
+      pool.delete(k)
+    }
+  }
+  try {
+    await client.connect()
   } catch (error) {
-    const msg = (error && error.message) || String(error)
-    if (msg.includes('ENOENT')) throw new RedisError('找不到 redis-cli，请确认已安装。', 500)
-    if (msg.includes('timed out') || msg.includes('ETIMEDOUT')) throw new RedisError('连接超时，请检查地址与端口。', 504)
-    // redis-cli often exits non-zero with a useful stderr message.
-    const detail = (error && error.stderr) ? String(error.stderr).trim() : msg
-    throw new RedisError(detail || '命令执行失败。')
+    try { client.disconnect() } catch (_) {}
+    pool.delete(key)
+    const t = translateError(error)
+    // ioredis reports a refused port as a bare "Connection is closed." with no code,
+    // which is not actionable; describe the target instead.
+    if (/连接已断开|Connection is closed/i.test(t.message)) {
+      const host = cfg.host || '127.0.0.1'
+      const port = Number(cfg.port) || 6379
+      throw new RedisError(`无法连接到 ${host}:${port}，请确认 Redis 服务已启动且地址端口正确。`, 502)
+    }
+    throw t
+  }
+  return client
+}
+function translateError(error) {
+  const msg = (error && error.message) || String(error)
+  const code = (error && error.code) || ''
+  if (/ECONNREFUSED/.test(code + msg)) return new RedisError('连接被拒绝，请检查地址与端口。', 502)
+  if (/ENOTFOUND/.test(code + msg)) return new RedisError('无法解析主机地址。', 502)
+  if (/ETIMEDOUT|connectTimeout/.test(code + msg)) return new RedisError('连接超时，请检查地址与端口。', 504)
+  if (/WRONGPASS|NOAUTH|invalid password/i.test(msg)) return new RedisError('密码错误或未授权。', 401)
+  if (/commandTimeout/i.test(code + msg)) return new RedisError('命令执行超时。', 504)
+  if (/Connection is closed|ECONNRESET|EPIPE|socket closed/i.test(code + msg)) {
+    return new RedisError('连接已断开，请检查 Redis 服务是否可用。', 502)
+  }
+  return new RedisError(msg || '命令执行失败。')
+}
+// Run one command through the pooled client.
+async function run(cfg, command, ...args) {
+  const client = await getClient(cfg)
+  try {
+    return await client.call(command, ...args)
+  } catch (error) {
+    throw translateError(error)
   }
 }
-function clean(s) { return String(s == null ? '' : s).replace(/\r/g, '') }
+
+function toText(value) {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string') return value
+  if (Buffer.isBuffer(value)) return value.toString('utf8')
+  return String(value)
+}
+function toLines(value) {
+  if (!Array.isArray(value)) return []
+  return value.map((v) => toText(v))
+}
+function toPairs(value) {
+  // ioredis returns different shapes per command: nested pairs for ZRANGE ... WITHSCORES
+  // ([["one","1"],["two","2"]]), a flat array for RESP2 HGETALL, or an object for RESP3.
+  if (!Array.isArray(value)) {
+    if (value && typeof value === 'object') {
+      return Object.entries(value).map(([field, v]) => ({ field, value: toText(v) }))
+    }
+    return []
+  }
+  if (value.length === 0) return []
+  // Nested case: every element is itself a [field, value] tuple.
+  if (Array.isArray(value[0])) {
+    return value
+      .filter((pair) => Array.isArray(pair) && pair.length >= 2)
+      .map((pair) => ({ field: toText(pair[0]), value: toText(pair[1]) }))
+  }
+  // Flat case: [field, value, field, value, ...]
+  const out = []
+  for (let i = 0; i < value.length; i += 2) {
+    out.push({ field: toText(value[i]), value: toText(value[i + 1]) })
+  }
+  return out
+}
+function parseLine(line) {
+  // Minimal shell-like split: honour single and double quotes.
+  const out = []
+  let cur = ''
+  let quote = ''
+  let has = false
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i]
+    if (quote) {
+      if (ch === quote) { quote = '' } else { cur += ch }
+      has = true
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; has = true; continue }
+    if (/\s/.test(ch)) {
+      if (has) { out.push(cur); cur = ''; has = false }
+      continue
+    }
+    cur += ch
+    has = true
+  }
+  if (has) out.push(cur)
+  return out
+}
 
 export function apply(ctx) {
   ctx.effect(() => {
@@ -83,8 +216,9 @@ export function apply(ctx) {
     register(route('ping', ['POST'], async (request) => {
       try {
         const body = await readBody(request)
-        const { out } = await run(body.connection || {}, ['PING'])
-        const text = clean(out).trim()
+        const cfg = await withStoredPassword(ctx, body.connection || {})
+        const reply = await run(cfg, 'PING')
+        const text = toText(reply).trim()
         return json({ ok: /PONG/i.test(text), raw: text })
       } catch (error) { return failure(error, '连接测试失败。') }
     }))
@@ -93,12 +227,11 @@ export function apply(ctx) {
     register(route('dbs', ['POST'], async (request) => {
       try {
         const body = await readBody(request)
-        const cfg = body.connection || {}
-        const base = { ...cfg, db: 0 }
-        const { out } = await run(base, ['INFO', 'keyspace'])
+        const cfg = await withStoredPassword(ctx, body.connection || {})
+        const info = toText(await run({ ...cfg, db: 0 }, 'INFO', 'keyspace'))
         const keyspace = {}
-        for (const line of clean(out).split('\n')) {
-          const m = line.match(/^db(\d+):(.*)$/)
+        for (const line of info.split('\n')) {
+          const m = line.replace(/\r$/, '').match(/^db(\d+):(.*)$/)
           if (m) keyspace[m[1]] = m[2].trim()
         }
         const dbs = Array.from({ length: 16 }, (_, i) => ({ index: i, info: keyspace[String(i)] || '' }))
@@ -106,25 +239,28 @@ export function apply(ctx) {
       } catch (error) { return failure(error, '无法读取数据库信息。') }
     }))
 
-    // Scan keys with MATCH using redis-cli --scan (iterator mode).
-    // Note: redis-cli 6.x supports --pattern but NOT --count; omit it.
+    // Scan keys with MATCH using SCAN cursor iteration.
     register(route('keys', ['POST'], async (request) => {
       try {
         const body = await readBody(request)
-        const cfg = body.connection || {}
+        const cfg = await withStoredPassword(ctx, body.connection || {})
         const pattern = typeof body.pattern === 'string' && body.pattern ? body.pattern : '*'
-        const args = [...connArgs(cfg), '--scan', '--pattern', pattern]
-        let stdout
-        try {
-          const r = await execFileAsync(CLI, args, { timeout: TIMEOUT, maxBuffer: 16 * 1024 * 1024 })
-          stdout = r.stdout
-        } catch (error) {
-          const detail = (error && error.stderr) ? String(error.stderr).trim() : ''
-          if (detail) throw new RedisError(detail)
-          throw error
-        }
-        const keys = clean(stdout).split('\n').map((k) => k.trim()).filter(Boolean).sort()
-        return json({ keys, total: keys.length, pattern })
+        const client = await getClient(cfg)
+        const keys = []
+        let cursor = '0'
+        const limit = 10000
+        do {
+          let reply
+          try {
+            reply = await client.scan(cursor, 'MATCH', pattern, 'COUNT', 500)
+          } catch (error) { throw translateError(error) }
+          cursor = String(reply[0])
+          const batch = reply[1] || []
+          for (const k of batch) keys.push(toText(k))
+          if (keys.length >= limit) break
+        } while (cursor !== '0')
+        const unique = Array.from(new Set(keys)).sort()
+        return json({ keys: unique, total: unique.length, pattern })
       } catch (error) { return failure(error, '无法扫描键。') }
     }))
 
@@ -132,25 +268,24 @@ export function apply(ctx) {
     register(route('get', ['POST'], async (request) => {
       try {
         const body = await readBody(request)
-        const cfg = body.connection || {}
+        const cfg = await withStoredPassword(ctx, body.connection || {})
         const key = body.key
         if (typeof key !== 'string' || !key) throw new RedisError('缺少键名。')
-        const { out: typeOut } = await run(cfg, ['TYPE', key])
-        const type = clean(typeOut).trim().replace(/^"|"$/g, '') || 'none'
+        const type = toText(await run(cfg, 'TYPE', key)).trim() || 'none'
         if (type === 'none') return json({ key, type: 'none', value: null, ttl: -2 })
-        const { out: ttlOut } = await run(cfg, ['TTL', key])
-        const ttl = parseInt(clean(ttlOut).trim(), 10)
+        const ttl = Number(await run(cfg, 'TTL', key))
         let value = null
         if (type === 'string') {
-          const r = await run(cfg, ['GET', key]); value = clean(r.out).replace(/\n$/, '')
+          value = toText(await run(cfg, 'GET', key))
         } else if (type === 'hash') {
-          const r = await run(cfg, ['HGETALL', key]); value = parsePairs(r.out)
+          value = toPairs(await run(cfg, 'HGETALL', key))
         } else if (type === 'list') {
-          const r = await run(cfg, ['LRANGE', key, '0', '199']); value = parseLines(r.out)
+          value = toLines(await run(cfg, 'LRANGE', key, 0, 199))
         } else if (type === 'set') {
-          const r = await run(cfg, ['SMEMBERS', key]); value = parseLines(r.out)
+          value = toLines(await run(cfg, 'SMEMBERS', key))
         } else if (type === 'zset') {
-          const r = await run(cfg, ['ZRANGE', key, '0', '199', 'WITHSCORES']); value = parsePairs(r.out)
+          const raw = await run(cfg, 'ZRANGE', key, 0, 199, 'WITHSCORES')
+          value = toPairs(raw)
         } else {
           value = '(unsupported type)'
         }
@@ -162,11 +297,11 @@ export function apply(ctx) {
     register(route('delete', ['POST'], async (request) => {
       try {
         const body = await readBody(request)
-        const cfg = body.connection || {}
+        const cfg = await withStoredPassword(ctx, body.connection || {})
         const keys = Array.isArray(body.keys) ? body.keys.filter((k) => typeof k === 'string' && k) : []
         if (!keys.length) throw new RedisError('缺少键名。')
-        const { out } = await run(cfg, ['DEL', ...keys])
-        return json({ ok: true, deleted: parseInt(clean(out).trim(), 10) || 0 })
+        const deleted = Number(await run(cfg, 'DEL', ...keys)) || 0
+        return json({ ok: true, deleted })
       } catch (error) { return failure(error, '删除失败。') }
     }))
 
@@ -174,30 +309,106 @@ export function apply(ctx) {
     register(route('expire', ['POST'], async (request) => {
       try {
         const body = await readBody(request)
-        const cfg = body.connection || {}
+        const cfg = await withStoredPassword(ctx, body.connection || {})
         const key = body.key
         const seconds = Number(body.seconds)
         if (typeof key !== 'string' || !key) throw new RedisError('缺少键名。')
         if (!Number.isFinite(seconds)) throw new RedisError('缺少有效期。')
-        const { out } = await run(cfg, ['EXPIRE', key, String(Math.round(seconds))])
-        return json({ ok: clean(out).trim() === '1' })
+        const r = Number(await run(cfg, 'EXPIRE', key, String(Math.round(seconds))))
+        return json({ ok: r === 1 })
       } catch (error) { return failure(error, '设置过期时间失败。') }
     }))
 
-    // Run an arbitrary read-only-ish command (user typed).
+    // Run an arbitrary command (user typed).
     register(route('command', ['POST'], async (request) => {
       try {
         const body = await readBody(request)
-        const cfg = body.connection || {}
+        const cfg = await withStoredPassword(ctx, body.connection || {})
         const line = typeof body.command === 'string' ? body.command.trim() : ''
         if (!line) throw new RedisError('请输入命令。')
-        const parts = splitCommand(line)
-        const { out, err } = await run(cfg, parts)
-        return json({ output: clean(out), warning: clean(err).trim() })
+        const parts = parseLine(line)
+        if (!parts.length) throw new RedisError('请输入命令。')
+        const client = await getClient(cfg)
+        let reply
+        try {
+          reply = await client.call(parts[0], ...parts.slice(1))
+        } catch (error) { throw translateError(error) }
+        return json({ output: formatReply(reply), warning: '' })
       } catch (error) { return failure(error, '命令执行失败。') }
     }))
 
+    // --- connection secrets: passwords live in DSH credentials, never in the browser ---
+    register(route('secret_set', ['POST'], async (request) => {
+      try {
+        const body = await readBody(request)
+        const id = typeof body.id === 'string' ? body.id.trim() : ''
+        const password = typeof body.password === 'string' ? body.password : ''
+        if (!id) throw new RedisError('缺少连接标识。')
+        if (!password) {
+          await ctx.credentials.unset(refOf(id))
+          const stillThere = Boolean(await getStoredPassword(ctx, id))
+          if (stillThere) throw new RedisError('清空密码失败，请重试。', 500)
+          return json({ ok: true, stored: false })
+        }
+        await ctx.credentials.set(refOf(id), password)
+        return json({ ok: true, stored: true })
+      } catch (error) { return failure(error, '保存密码失败。') }
+    }))
+
+    register(route('secret_clear', ['POST'], async (request) => {
+      try {
+        const body = await readBody(request)
+        const id = typeof body.id === 'string' ? body.id.trim() : ''
+        if (!id) throw new RedisError('缺少连接标识。')
+        // Do not swallow a failed unset: leftover passwords are a real risk.
+        await ctx.credentials.unset(refOf(id))
+        const stillThere = Boolean(await getStoredPassword(ctx, id))
+        if (stillThere) throw new RedisError('密码未能从凭证库删除，请重试。', 500)
+        return json({ ok: true, cleared: true })
+      } catch (error) { return failure(error, '删除密码失败。') }
+    }))
+
+    // Remove stored passwords whose connection no longer exists (housekeeping).
+    // The Client sends every live connection id; anything else under REDIS_CONN_* is orphaned.
+    register(route('secret_prune', ['POST'], async (request) => {
+      try {
+        const body = await readBody(request)
+        const keepIds = Array.isArray(body.ids) ? body.ids.map((x) => String(x)).filter(Boolean) : []
+        let records = []
+        try {
+          records = await ctx.credentials.listRecords()
+        } catch (_) { records = [] }
+        const keepRefs = new Set(keepIds.map((id) => refOf(id)))
+        let removed = 0
+        for (const record of records || []) {
+          const key = String((record && (record.key || record.ref || record.id || record.name)) || '')
+          if (!key.startsWith('REDIS_CONN_')) continue
+          if (keepRefs.has(key)) continue
+          try { await ctx.credentials.unset(key); removed += 1 } catch (_) {}
+        }
+        return json({ ok: true, removed })
+      } catch (error) { return failure(error, '清理孤立密码失败。') }
+    }))
+
+    // Report which connections have a stored password (never returns the value).
+    register(route('secret_has', ['POST'], async (request) => {
+      try {
+        const body = await readBody(request)
+        const ids = Array.isArray(body.ids) ? body.ids.map((x) => String(x)) : []
+        const result = {}
+        for (const id of ids) {
+          if (!id) continue
+          result[id] = Boolean(await getStoredPassword(ctx, id))
+        }
+        return json({ result })
+      } catch (error) { return failure(error, '查询密码状态失败。') }
+    }))
+
     return () => {
+      for (const client of pool.values()) {
+        try { client.disconnect() } catch (_) {}
+      }
+      pool.clear()
       for (const dispose of disposers) {
         try {
           const result = dispose()
@@ -208,29 +419,24 @@ export function apply(ctx) {
   }, 'dsh-redis-client: routes')
 }
 
-function parseLines(text) {
-  return clean(text).split('\n').map((l) => l.trim()).filter((l) => l.length > 0)
-}
-function parsePairs(text) {
-  const lines = parseLines(text)
-  const out = []
-  for (let i = 0; i < lines.length; i += 2) out.push({ field: lines[i], value: lines[i + 1] === undefined ? '' : lines[i + 1] })
-  return out
-}
-function splitCommand(line) {
-  // Simple quote-aware tokenizer for typed redis commands.
-  const out = []
-  let cur = ''
-  let quote = null
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i]
-    if (quote) {
-      if (ch === quote && line[i - 1] !== '\\') { quote = null }
-      else cur += ch
-    } else if (ch === '"' || ch === "'") quote = ch
-    else if (/\s/.test(ch)) { if (cur) { out.push(cur); cur = '' } }
-    else cur += ch
+// Pretty-print a Redis reply for the command console.
+function formatReply(reply) {
+  if (reply === null || reply === undefined) return '(nil)'
+  if (typeof reply === 'number') return String(reply)
+  if (typeof reply === 'string') return reply
+  if (Buffer.isBuffer(reply)) return reply.toString('utf8')
+  if (Array.isArray(reply)) {
+    return reply.map((item, i) => `${String(i + 1)}) ${formatInline(item)}`).join('\n')
   }
-  if (cur) out.push(cur)
-  return out
+  if (typeof reply === 'object') {
+    return Object.entries(reply).map(([k, v]) => `${k}: ${formatInline(v)}`).join('\n')
+  }
+  return String(reply)
+}
+function formatInline(value) {
+  if (value === null || value === undefined) return '(nil)'
+  if (Array.isArray(value)) return value.map(formatInline).join(', ')
+  if (Buffer.isBuffer(value)) return value.toString('utf8')
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
 }
