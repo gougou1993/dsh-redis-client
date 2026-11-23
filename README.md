@@ -5,7 +5,7 @@ A Redis management plugin for DSH (DeepSeek Harness). It provides a left-sidebar
 ## Plugin Info
 
 - **Package**: `@oakzhong/dsh-redis-client`
-- **Version**: 1.1.2
+- **Version**: 1.2.1
 - **Entry**: left sidebar panel "Redis client" (slot id `redis-client`)
 - **Type**: Host + Client two-half Cordis bundle
 
@@ -92,3 +92,10 @@ dsh-redis-client/
 3. Click "Redis client" in the left sidebar.
 4. Create a connection and test it; once connected, scan keys, inspect values, and run commands.
 5. After changing Host-side code, disable → enable the plugin to reload routes (`unlag_refresh` only refreshes the front end).
+
+### Server information
+- Click **Server info** next to **Test connection** to fetch and display live Redis `INFO` statistics.
+- Shows: Redis version, running mode, OS / architecture, process ID, port, uptime, connected clients, used / peak memory, key count (DB0), total commands processed, and cache hit rate.
+- Click **Hide info** to collapse the panel; switching connections clears it automatically.
+- Connection action buttons use a uniform 2-column grid (equal size, aligned); click **Hide info** again to close the panel.
+- The left column can be collapsed/expanded as a whole: click the «/» button in the header; the remaining columns expand to fill the width.

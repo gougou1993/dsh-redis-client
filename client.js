@@ -34,6 +34,11 @@ window.__ModuleLoader__.load({
       pwdSaved: '密码已保存到本机凭证库', pwdHint: '密码保存在本机凭证库，不写入浏览器存储', pwdEmpty: '留空则不修改已存密码',
       secretClearFail: '删除连接失败：密码未能从凭证库清除', pruneSecret: '清理孤立密码', prunedN: '已清理 {n} 条孤立密码', pruneNone: '没有孤立密码',
       group: '分组', groupPlaceholder: '分组名称（留空=未分组）', ungrouped: '未分组', collapseAll: '全部折叠', expandAll: '全部展开',
+      expand: '展开', collapse: '收起', collapseSide: '收起左栏', expandSide: '展开左栏',
+      serverInfo: '服务器信息', infoFail: '读取服务器信息失败', infoHint: '点击「服务器信息」查看服务器状态',
+      infoVersion: 'Redis 版本', infoMode: '运行模式', infoOs: '操作系统', infoArch: '架构', infoPid: '进程 ID', infoPort: '端口',
+      infoUptime: '运行时间', infoClients: '已连接客户端', infoMemory: '已用内存', infoMemoryPeak: '峰值内存',
+      infoKeys: '键数量(DB0)', infoCommands: '已处理命令', infoHitRate: '缓存命中率', infoClose: '收起信息',
     }
     const en = {
       title: 'Redis client', subtitle: 'Manage Redis connections and browse keys and values.',
@@ -51,6 +56,11 @@ window.__ModuleLoader__.load({
       pwdSaved: 'Password saved to the local credential store', pwdHint: 'Passwords live in the local credential store, not browser storage', pwdEmpty: 'Leave blank to keep the stored password',
       secretClearFail: 'Delete aborted: the stored password could not be cleared', pruneSecret: 'Prune orphaned passwords', prunedN: 'Pruned {n} orphaned passwords', pruneNone: 'No orphaned passwords',
       group: 'Group', groupPlaceholder: 'Group name (blank = ungrouped)', ungrouped: 'Ungrouped', collapseAll: 'Collapse all', expandAll: 'Expand all',
+      expand: 'Expand', collapse: 'Collapse', collapseSide: 'Hide sidebar', expandSide: 'Show sidebar',
+      serverInfo: 'Server info', infoFail: 'Failed to load server info', infoHint: 'Click "Server info" to view server status',
+      infoVersion: 'Redis version', infoMode: 'Mode', infoOs: 'OS', infoArch: 'Architecture', infoPid: 'Process ID', infoPort: 'Port',
+      infoUptime: 'Uptime', infoClients: 'Connected clients', infoMemory: 'Memory used', infoMemoryPeak: 'Peak memory',
+      infoKeys: 'Keys (DB0)', infoCommands: 'Total commands', infoHitRate: 'Hit rate', infoClose: 'Hide info',
     }
     let t = (key) => (zh[key] || key)
     const fmt = (s, v) => String(s || '').replace(/\{(\w+)\}/g, (_, k) => (v && v[k] != null ? v[k] : ''))
@@ -98,9 +108,13 @@ window.__ModuleLoader__.load({
       const [conns, setConns] = useState(readConns)
       const [activeId, setActiveId] = useState(readActive)
       const [editing, setEditing] = useState(null)
+      const [formCollapsed, setFormCollapsed] = useState(false)
+      const [sideCollapsed, setSideCollapsed] = useState(false)
       const [form, setForm] = useState({ name: '', host: '127.0.0.1', port: 6379, password: '', username: '', db: 0, group: '' })
       const [ping, setPing] = useState('')
       const [pingOk, setPingOk] = useState(false)
+      const [serverInfo, setServerInfo] = useState(null)
+      const [infoLoading, setInfoLoading] = useState(false)
       const [collapsed, setCollapsed] = useState({})
       const [keys, setKeys] = useState([])
       const [pattern, setPattern] = useState('*')
@@ -257,8 +271,18 @@ window.__ModuleLoader__.load({
           return
         }
         setConns((prev) => prev.filter((c) => c.id !== id))
-        if (activeId === id) { setActiveId(''); setKeys([]); setSelected(''); setDetail(null); setPing(''); setPingOk(false) }
+        if (activeId === id) { setActiveId(''); setKeys([]); setSelected(''); setDetail(null); setPing(''); setPingOk(false); setServerInfo(null) }
       }, [activeId])
+
+      const loadServerInfo = useCallback(async () => {
+        if (!connCfg) return
+        setInfoLoading(true); setErr('')
+        try {
+          const d = await api('/info', { connection: connCfg })
+          setServerInfo(d.info || null)
+        } catch (e) { setErr(t('infoFail') + (e.message ? ': ' + e.message : '')); setServerInfo(null) }
+        finally { setInfoLoading(false) }
+      }, [connCfg])
 
       const testConn = useCallback(async () => {
         if (!connCfg) return
@@ -332,6 +356,12 @@ window.__ModuleLoader__.load({
         }
       }, [ctx])
 
+      const infoRow = (labelKey, value) =>
+        h('div', { className: 'dshRds-infoRow' },
+          h('span', { className: 'dshRds-infoLabel' }, t(labelKey)),
+          h('span', { className: 'dshRds-infoValue' }, value != null && value !== '' ? String(value) : '-')
+        )
+
       const formRow = (label, key, type) =>
         h('label', { className: 'dshRds-field' },
           h('span', null, t(label)),
@@ -353,18 +383,21 @@ window.__ModuleLoader__.load({
             : h('pre', { className: 'dshRds-value' }, String(detail.value)))
         : null
 
-      return h('div', { className: 'dshRds-root' },
+      return h('div', { className: 'dshRds-root' + (sideCollapsed ? ' dshRds-sideOff' : '') },
         h('div', { className: 'dshRds-head' },
           h('div', null,
             h('div', { className: 'dshRds-title' }, t('title')),
             h('div', { className: 'dshRds-sub' }, t('subtitle'))
           ),
-          h('button', { type: 'button', className: 'dshRds-back', onClick: goBack }, t('back'))
+          h('div', { className: 'dshRds-headActions' },
+            h('button', { type: 'button', className: 'dshRds-back', title: sideCollapsed ? t('expandSide') : t('collapseSide'), onClick: () => setSideCollapsed((v) => !v) }, sideCollapsed ? '»' : '«'),
+            h('button', { type: 'button', className: 'dshRds-back', onClick: goBack }, t('back'))
+          )
         ),
         err ? h('div', { className: 'dshRds-err' }, err) : null,
-        h('div', { className: 'dshRds-cols' },
+        h('div', { className: 'dshRds-cols', style: sideCollapsed ? { gridTemplateColumns: 'minmax(0,1fr) minmax(0,1.2fr)' } : undefined },
           // left: connections
-          h('div', { className: 'dshRds-col' },
+          h('div', { className: 'dshRds-col', style: sideCollapsed ? { display: 'none' } : undefined },
             h('div', { className: 'dshRds-card' },
               h('div', { className: 'dshRds-cardTitleRow' },
                 h('span', { className: 'dshRds-cardTitle' }, t('connections')),
@@ -403,7 +436,7 @@ window.__ModuleLoader__.load({
                               h('div', {
                                 key: c.id,
                                 className: 'dshRds-conn' + (activeId === c.id ? ' dshRds-connOn' : ''),
-                                onClick: () => { setActiveId(c.id); setKeys([]); setSelected(''); setDetail(null); setPing(''); setPingOk(false) },
+                                onClick: () => { setActiveId(c.id); setKeys([]); setSelected(''); setDetail(null); setPing(''); setPingOk(false); setServerInfo(null) },
                               },
                                 h('span', { className: 'dshRds-name' }, c.name),
                                 h('span', { className: 'dshRds-addr' }, `${c.host}:${c.port}`),
@@ -415,24 +448,50 @@ window.__ModuleLoader__.load({
                       )
                     })
               ),
-              h('div', { className: 'dshRds-btnRow' },
+              h('div', { className: 'dshRds-btnGrid' },
                 h('button', { type: 'button', className: 'dshRds-btn dshRds-btnPrimary', onClick: () => { setEditing(null); setForm({ name: '', host: '127.0.0.1', port: 6379, password: '', username: '', db: 0, group: '' }) } }, '+ ' + t('newConn')),
-                h('button', { type: 'button', className: 'dshRds-btn', disabled: !active || busy, onClick: testConn }, t('test'))
-              ),
-              h('div', { className: 'dshRds-btnRow' },
+                h('button', { type: 'button', className: 'dshRds-btn', disabled: !active || busy, onClick: testConn }, t('test')),
+                h('button', { type: 'button', className: 'dshRds-btn', disabled: !active || busy || infoLoading, onClick: serverInfo ? () => setServerInfo(null) : loadServerInfo }, infoLoading ? '...' : (serverInfo ? t('infoClose') : t('serverInfo'))),
+                h('button', { type: 'button', className: 'dshRds-btn', disabled: busy, title: t('pruneSecret'), onClick: pruneSecrets }, t('pruneSecret')),
                 h('button', { type: 'button', className: 'dshRds-btn', title: t('export'), onClick: exportConns }, t('export')),
                 h('button', { type: 'button', className: 'dshRds-btn', title: t('import'), onClick: () => fileRef.current && fileRef.current.click() }, t('import'))
               ),
-              h('button', { type: 'button', className: 'dshRds-btn dshRds-btnWide', disabled: busy, title: t('pruneSecret'), onClick: pruneSecrets }, t('pruneSecret')),
               h('input', { ref: fileRef, type: 'file', accept: '.json,application/json', style: { display: 'none' }, onChange: importConns }),
               ping
                 ? h('div', { className: 'dshRds-ping ' + (pingOk ? 'dshRds-pingOk' : 'dshRds-pingFail') }, ping)
+                : null,
+              serverInfo
+                ? h('div', { className: 'dshRds-infoPanel' },
+                    h('div', { className: 'dshRds-infoTitle' }, t('serverInfo')),
+                    h('div', { className: 'dshRds-infoGrid' },
+                      infoRow('infoVersion', serverInfo.version),
+                      infoRow('infoMode', serverInfo.mode),
+                      infoRow('infoOs', serverInfo.os),
+                      infoRow('infoArch', serverInfo.arch),
+                      infoRow('infoPid', serverInfo.processId),
+                      infoRow('infoPort', serverInfo.port),
+                      infoRow('infoUptime', serverInfo.uptime),
+                      infoRow('infoClients', serverInfo.clients),
+                      infoRow('infoMemory', serverInfo.memoryUsed),
+                      infoRow('infoMemoryPeak', serverInfo.memoryPeak),
+                      infoRow('infoKeys', serverInfo.keys),
+                      infoRow('infoCommands', serverInfo.totalCommands),
+                      infoRow('infoHitRate', serverInfo.hittingRate)
+                    )
+                  )
                 : null
             ),
             // connection form
             h('div', { className: 'dshRds-card' },
-              h('div', { className: 'dshRds-cardTitle' }, editing ? t('edit') : t('newConn')),
-              h('div', { className: 'dshRds-form' },
+              h('div', {
+                className: 'dshRds-cardTitle dshRds-cardToggle',
+                title: formCollapsed ? t('expand') : t('collapse'),
+                onClick: () => setFormCollapsed((v) => !v),
+              },
+                h('span', { className: 'dshRds-toggleArrow' }, formCollapsed ? '▸' : '▾'),
+                formCollapsed ? t('newConn') : (editing ? t('edit') : t('newConn'))
+              ),
+              formCollapsed ? null : h('div', { className: 'dshRds-form' },
                 formRow('name', 'name'), formRow('host', 'host'),
                 formRow('port', 'port', 'number'), formRow('password', 'password', 'password'),
                 formRow('username', 'username'), formRow('db', 'db', 'number'),
@@ -541,6 +600,9 @@ window.__ModuleLoader__.load({
       style.textContent = `
 .dshRds-root{display:flex;flex-direction:column;height:100%;box-sizing:border-box;padding:16px 18px 18px;gap:12px;overflow:hidden;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base)}
 .dshRds-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex:0 0 auto}
+.dshRds-headActions{display:flex;align-items:center;gap:6px}
+.dshRds-sideOff .dshRds-cols{grid-template-columns:minmax(0,1fr) minmax(0,1.2fr)}
+.dshRds-sideOff .dshRds-cols > .dshRds-col:first-child{display:none}
 .dshRds-title{font-size:20px;font-weight:700;line-height:1.3}
 .dshRds-sub{font-size:12px;color:var(--dsw-alias-label-secondary);margin-top:3px}
 .dshRds-back{display:inline-flex;align-items:center;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-size:12px;padding:5px 11px;border-radius:8px;cursor:pointer;font-family:inherit;white-space:nowrap}
@@ -550,13 +612,21 @@ window.__ModuleLoader__.load({
 .dshRds-card{padding:12px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);display:flex;flex-direction:column;gap:8px}
 .dshRds-fill{flex:1 1 auto;min-height:0}
 .dshRds-cardTitle{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary)}
+.dshRds-cardToggle{cursor:pointer;display:flex;align-items:center;gap:6px;user-select:none}
+.dshRds-cardToggle:hover{color:var(--dsw-alias-label-primary)}
+.dshRds-toggleArrow{width:10px;flex:0 0 auto;font-size:10px}
 .dshRds-note{font-size:11px;color:var(--dsw-alias-label-secondary);line-height:1.5}
-.dshRds-btnRow{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.dshRds-btnRow .dshRds-btn{width:100%}
-.dshRds-btnWide{width:100%}
+.dshRds-btnGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.dshRds-btnGrid .dshRds-btn{width:100%;min-width:0}
 .dshRds-ping{font-size:11px;line-height:1.5;font-weight:600;padding:4px 0}
 .dshRds-pingOk{color:#2e7d32}
 .dshRds-pingFail{color:var(--dsw-alias-state-error-primary)}
+.dshRds-infoPanel{margin-top:8px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);padding:8px 10px}
+.dshRds-infoTitle{font-size:11px;font-weight:600;color:var(--dsw-alias-label-primary);margin-bottom:6px}
+.dshRds-infoGrid{display:grid;grid-template-columns:1fr;gap:3px}
+.dshRds-infoRow{display:flex;justify-content:space-between;gap:10px;font-size:11px;line-height:1.5}
+.dshRds-infoLabel{color:var(--dsw-alias-label-secondary);flex:0 0 auto}
+.dshRds-infoValue{color:var(--dsw-alias-label-primary);text-align:right;word-break:break-all;user-select:text}
 .dshRds-btn{padding:7px 11px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-size:12px;cursor:pointer;font-family:inherit;white-space:nowrap}
 .dshRds-btn:hover{border-color:var(--dsw-alias-brand-primary)}
 .dshRds-btn:disabled{opacity:.45;cursor:not-allowed}

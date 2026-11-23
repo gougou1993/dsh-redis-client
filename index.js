@@ -223,6 +223,55 @@ export function apply(ctx) {
       } catch (error) { return failure(error, '连接测试失败。') }
     }))
 
+    // Server information: parse INFO into a grouped, human-friendly set of fields.
+    register(route('info', ['POST'], async (request) => {
+      try {
+        const body = await readBody(request)
+        const cfg = await withStoredPassword(ctx, body.connection || {})
+        const raw = toText(await run(cfg, 'INFO'))
+        const fields = {}
+        let section = ''
+        for (const line of raw.split('\n')) {
+          const clean = line.replace(/\r$/, '')
+          if (!clean) continue
+          if (clean.startsWith('#')) { section = clean.replace(/^#+\s*/, '').trim(); continue }
+          const idx = clean.indexOf(':')
+          if (idx < 0) continue
+          const key = clean.slice(0, idx)
+          const value = clean.slice(idx + 1)
+          fields[key] = value
+          if (section) fields[section + '.' + key] = value
+        }
+        // Humanize uptime (seconds) into days/hours/minutes.
+        const uptimeSec = Number(fields.uptime_in_seconds || 0)
+        const days = Math.floor(uptimeSec / 86400)
+        const hours = Math.floor((uptimeSec % 86400) / 3600)
+        const minutes = Math.floor((uptimeSec % 3600) / 60)
+        const uptime = [days ? days + 'd' : '', hours ? hours + 'h' : '', minutes + 'm'].filter(Boolean).join(' ') || (uptimeSec + 's')
+        // Hit rate from keyspace hits/misses.
+        const hits = Number(fields.keyspace_hits || 0)
+        const misses = Number(fields.keyspace_misses || 0)
+        const total = hits + misses
+        const hitRate = total ? (hits / total * 100).toFixed(1) + '%' : '-'
+        const info = {
+          version: fields.redis_version || '-',
+          mode: fields.redis_mode || 'standalone',
+          os: fields.os || '-',
+          arch: fields.process_arch || '-',
+          processId: fields.process_id || '-',
+          port: fields.tcp_port || '-',
+          uptime, uptimeSec,
+          clients: fields.connected_clients || '-',
+          memoryUsed: fields.used_memory_human || '-',
+          memoryPeak: fields.used_memory_peak_human || '-',
+          keys: fields.db0 ? (fields.db0.match(/keys=(\d+)/) || [])[1] || '0' : '0',
+          totalCommands: fields.total_commands_processed || '-',
+          hittingRate: hitRate,
+        }
+        return json({ info })
+      } catch (error) { return failure(error, '无法读取服务器信息。') }
+    }))
+
     // List all 16 databases via INFO keyspace (best effort).
     register(route('dbs', ['POST'], async (request) => {
       try {
