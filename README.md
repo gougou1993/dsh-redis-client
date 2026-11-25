@@ -5,7 +5,7 @@ A Redis management plugin for DSH (DeepSeek Harness). It provides a left-sidebar
 ## Plugin Info
 
 - **Package**: `@oakzhong/dsh-redis-client`
-- **Version**: 1.2.1
+- **Version**: 1.2.2
 - **Entry**: left sidebar panel "Redis client" (slot id `redis-client`)
 - **Type**: Host + Client two-half Cordis bundle
 

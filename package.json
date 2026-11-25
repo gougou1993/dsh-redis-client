@@ -1,6 +1,6 @@
 {
   "name": "@oakzhong/dsh-redis-client",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "private": false,
   "publishConfig": {
     "access": "public"
@@ -33,9 +33,18 @@
       "inject": [
         "@deepseek-ai/dsh-client-locale"
       ]
+    },
+    "compatibility": {
+      "dsh": ">=0.2.0-rc.1 <0.3.0-0"
     }
   },
   "dependencies": {
     "ioredis": "^6.0.0"
-  }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek"
+  ]
 }

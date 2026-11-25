@@ -5,7 +5,7 @@
 ## 插件信息
 
 - **包名**：`@oakzhong/dsh-redis-client`
-- **版本**：1.2.1
+- **版本**：1.2.2
 - **入口**：左侧栏面板「Redis 客户端」（slot id `redis-client`）
 - **类型**：Host + Client 双半部 Cordis bundle
 
